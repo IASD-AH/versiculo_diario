@@ -1,0 +1,219 @@
+name: Publicar Versículo Diário no Telegram e WhatsApp
+
+# 14:00 em Lisboa. O cron do GitHub é em UTC e Portugal muda de hora:
+# agenda-se às 13:00 e às 14:00 UTC e o job "horario" deixa passar só a
+# que corresponde às 14:00 de Lisboa nesse dia (13 UTC no verão, 14 UTC
+# no inverno). A decisão usa o cron que disparou, não a hora real, por
+# isso continua certa mesmo quando o GitHub atrasa o arranque.
+on:
+  schedule:
+    - cron: '0 13 * * *'
+    - cron: '0 14 * * *'
+
+  workflow_dispatch:
+    inputs:
+      pareamento:
+        description: 'Gerar QR e atualizar sessão sem publicar'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: versiculo-diario
+  cancel-in-progress: false
+
+jobs:
+
+  horario:
+    runs-on: ubuntu-latest
+    outputs:
+      publicar: ${{ steps.verificar.outputs.publicar }}
+    steps:
+      - name: Verificar se são 14:00 em Lisboa
+        id: verificar
+        env:
+          EVENTO: ${{ github.event_name }}
+          CRON: ${{ github.event.schedule }}
+        run: |
+          if [ "$EVENTO" != "schedule" ]; then
+            echo "publicar=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$(TZ=Europe/Lisbon date +%z)" = "+0100" ]; then
+            ESPERADO='0 13 * * *'
+          else
+            ESPERADO='0 14 * * *'
+          fi
+          echo "Cron que disparou: '$CRON' | esperado hoje: '$ESPERADO'"
+          if [ "$CRON" = "$ESPERADO" ]; then
+            echo "publicar=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publicar=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publicar:
+    needs: horario
+    if: ${{ needs.horario.outputs.publicar == 'true' }}
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    steps:
+
+      ############################################################
+      # CHECKOUT E AMBIENTE
+      ############################################################
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mostrar hora do runner
+        run: date -u
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      ############################################################
+      # RESTAURAR SESSÃO
+      ############################################################
+      # Descarrega o artefacto whatsapp-session mais recente e não expirado.
+      # A sessão (= acesso total à conta WhatsApp) está cifrada com AES-256
+      # usando o secret WHATSAPP_SESSION_KEY.
+
+      - name: Restaurar sessão WhatsApp
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WHATSAPP_SESSION_KEY: ${{ secrets.WHATSAPP_SESSION_KEY }}
+        run: |
+          ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=whatsapp-session&per_page=30" \
+                 --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | reverse | .[0].id // empty')
+          if [ -z "$ID" ]; then
+            echo "::warning::Nenhum artefacto whatsapp-session disponível — corra o workflow com 'pareamento'."
+            exit 0
+          fi
+          echo "A descarregar artefacto $ID"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ID}/zip" > session.zip
+          unzip -o -q session.zip
+          rm -f session.zip
+          if [ -f whatsapp-session.tar.gz.enc ]; then
+            if [ -z "$WHATSAPP_SESSION_KEY" ]; then
+              echo "::error::Sessão cifrada mas o secret WHATSAPP_SESSION_KEY não está definido."
+              exit 1
+            fi
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -in whatsapp-session.tar.gz.enc -out whatsapp-session.tar.gz \
+              -pass env:WHATSAPP_SESSION_KEY
+            rm -f whatsapp-session.tar.gz.enc
+          fi
+          ls -lh whatsapp-session*.tar.gz
+
+      - name: Extrair e validar sessão
+        run: |
+          python session_manager.py restore --forcar || \
+            python session_manager.py recuperar --forcar || true
+          # Locks de um Chromium antigo impedem o arranque ("browser is already running").
+          rm -f whatsapp_auth/session/Singleton* || true
+          # Nunca herdar o marker de sessão fresca de outra execução.
+          rm -f .session_fresh
+          du -sh whatsapp_auth 2>/dev/null || echo "whatsapp_auth inexistente"
+
+      ############################################################
+      # DEPENDÊNCIAS
+      ############################################################
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests==2.32.5 urllib3==2.5.0
+          npm ci --no-audit --no-fund
+
+      ############################################################
+      # TELEGRAM (+ payload do WhatsApp)
+      ############################################################
+
+      - name: Publicar Telegram
+        if: ${{ !inputs.pareamento }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_PERSONAL_CHAT_ID: ${{ secrets.TELEGRAM_PERSONAL_CHAT_ID }}
+          # Opcional (variável do repositório): dia do versículo n.º 1, AAAA-MM-DD.
+          VERSICULOS_DATA_INICIO: ${{ vars.VERSICULOS_DATA_INICIO }}
+        run: python versiculo_diario.py
+
+      ############################################################
+      # WHATSAPP
+      ############################################################
+
+      - name: Enviar WhatsApp
+        env:
+          WHATSAPP_GROUP_ID: ${{ secrets.WHATSAPP_GROUP_ID }}
+          WHATSAPP_PAREAMENTO: ${{ inputs.pareamento && '1' || '0' }}
+          # Opcional: fixar a versão do WhatsApp Web (variável do repositório).
+          WHATSAPP_WEB_VERSION: ${{ vars.WHATSAPP_WEB_VERSION }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          # QR só para o chat pessoal do administrador, nunca para o canal.
+          TELEGRAM_PERSONAL_CHAT_ID: ${{ secrets.TELEGRAM_PERSONAL_CHAT_ID }}
+        run: node send_whatsapp.js
+
+      ############################################################
+      # ALERTA DE FALHA
+      ############################################################
+
+      - name: Alerta de falha
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_PERSONAL_CHAT_ID: ${{ secrets.TELEGRAM_PERSONAL_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SESSAO_FRESCA: ${{ hashFiles('.session_fresh') != '' && '1' || '0' }}
+        run: python alert_failure.py
+
+      ############################################################
+      # GUARDAR SESSÃO
+      ############################################################
+      # Guarda sempre que ESTA execução autenticou (.session_fresh), mesmo
+      # que o envio tenha falhado. Nunca guarda sem cifra.
+
+      - name: Limpar caches da sessão
+        if: ${{ always() && hashFiles('.session_fresh') != '' }}
+        run: python session_manager.py clean
+
+      - name: Compactar e cifrar sessão
+        if: ${{ always() && hashFiles('.session_fresh') != '' }}
+        env:
+          WHATSAPP_SESSION_KEY: ${{ secrets.WHATSAPP_SESSION_KEY }}
+        run: |
+          python session_manager.py compress
+          if [ -z "$WHATSAPP_SESSION_KEY" ]; then
+            echo "::error::WHATSAPP_SESSION_KEY não definido: a sessão não é guardada sem cifra."
+            rm -f whatsapp-session.tar.gz
+            exit 1
+          fi
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -in whatsapp-session.tar.gz -out whatsapp-session.tar.gz.enc \
+            -pass env:WHATSAPP_SESSION_KEY
+          rm -f whatsapp-session.tar.gz
+          ls -lh whatsapp-session.tar.gz*
+
+      - name: Guardar sessão WhatsApp
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && hashFiles('whatsapp-session.tar.gz.enc') != '' }}
+        with:
+          name: whatsapp-session
+          path: whatsapp-session.tar.gz.enc
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
